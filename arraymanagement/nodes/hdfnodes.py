@@ -4,6 +4,12 @@ from os.path import basename, splitext, join, isfile, isdir, dirname, exists
 import posixpath
 import math
 
+import tables
+from tables.earray import EArray
+from tables.carray import CArray
+from tables.array import Array
+from tables.table import Table
+
 import pandas as pd
 import numpy as np
 import datetime as dt
@@ -17,6 +23,11 @@ logger = logging.getLogger(__name__)
 ## These classes are a big misleading because all pandas dataframes are stored inside a group.. however 
 ## for here, we use pandas conventions, and the group mixin is used for real groups, whereas groups
 ## that are used only to contain a pandas object are treated as datasets
+
+#suppress pytables warnings
+import warnings
+warnings.filterwarnings('ignore',category=pd.io.pytables.PerformanceWarning)
+
 
 class HDFDataGroupMixin(object):
     def put(self, key, *args, **kwargs):
@@ -73,6 +84,7 @@ def get_pandas_hdf5(path):
         store = pd.HDFStore(path, complib='blosc')
         pandas_hdf5_cache[path] = store
     return store
+
 
 def hack_pandas_ns_issue(col):
     col[col > dt.datetime(2250,1,1)] = dt.datetime(2250,1,1)
@@ -167,10 +179,14 @@ class PandasHDFNode(Node, HDFDataSetMixin, HDFDataGroupMixin):
     def __init__(self, context, localpath="/"):
         super(PandasHDFNode, self).__init__(context)
         self.localpath = localpath
-        self.store = get_pandas_hdf5(self.absolute_file_path)
+
+        try:
+            self.store = get_pandas_hdf5(self.cache_dir)
+        except IOError:
+            self.store = get_pandas_hdf5(self.absolute_file_path)
         # this will either point to a hdf group, or an hdf table... maybe this is bad idea
         # to do this all in one class but for now...
-        if self.store.keys() == ['__data__']:
+        if self.store.keys() == ['/__data__']:
             self.localpath = "/__data__"
             self.is_group = False
         elif self.localpath in self.store.keys():
@@ -216,7 +232,8 @@ class PandasCacheable(Node, HDFDataSetMixin):
 
     def cache_path(self):
         cache_name = "cache_%s.hdf5" % self.key
-        apath = self.absolute_file_path
+
+        apath = self.cache_dir
         if isfile(apath):
             cachedir = join(dirname(apath), '.cache')
         else:
@@ -264,7 +281,7 @@ class PandasCacheableFixed(PandasCacheable):
     """
     inmemory_cache = {}
     def cache_key(self):
-        return self.absolute_file_path, self.localpath
+        return self.cache_dir, self.localpath
     
     def load_data(self):
         data = self.get_data()
@@ -284,3 +301,35 @@ class PandasCacheableFixed(PandasCacheable):
     def get(self, *args, **kwargs):
         self._load_data(force=kwargs.pop('force', None))
         return self.inmemory_cache[self.cache_key()]
+
+
+class PyTables(Node):
+    def __init__(self, context, localpath="/"):
+        super(PyTables, self).__init__(context)
+        self.localpath = localpath
+        self.handle = tables.File(self.absolute_file_path)
+        if self.localpath == "/":
+            children = [x._v_pathname for x in self.handle.listNodes(self.localpath)]
+            if children == ['/__data__']:
+                self.localpath = "/__data__"
+                self.is_group = False
+        self.node = self.handle.getNode(self.localpath)
+        if isinstance(self.node, (EArray, CArray, Table, Array)):
+            self.is_group = False
+        else:
+            self.is_group = True
+            
+    def keys(self):
+        if not self.is_group:
+            return ArrayManagementException, 'This node is not a group'
+        keys = [x._v_pathname for x in self.handle.list_nodes(self.localpath)]
+        keys = [x for x in keys if x.startswith(self.localpath) and x!= self.localpath]
+        keys = [dirsplit(x, self.localpath)[0] for x in keys]
+        return keys
+
+    def get_node(self, key):
+        if not self.is_group:
+            return ArrayManagementException, 'This node is not a group'
+        new_local_path = posixpath.join(self.localpath, key)
+        return self.__class__(self.context, localpath=new_local_path)
+

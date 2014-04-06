@@ -5,7 +5,6 @@ from os.path import join, relpath
 import pandas as pd
 from pandas.io import sql
 import json
-import logging
 import itertools
 import cPickle as pickle
 import hashlib
@@ -23,9 +22,18 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 
-logger = logging.getLogger(__name__)
+from arraymanagement.logger import log
 
+import yaml
+import tables
+import sys
+from pdb import set_trace
+from collections import defaultdict
 
+#suppress pytables warnings
+import warnings
+warnings.filterwarnings('ignore',category=pd.io.pytables.PerformanceWarning)
+warnings.filterwarnings('ignore',category=tables.NaturalNameWarning)
 
 class DumbParameterizedQueryTable(PandasCacheableTable):
     config_fields = ['query',
@@ -64,7 +72,7 @@ class DumbParameterizedQueryTable(PandasCacheableTable):
     def init_from_file(self):
         with open(join(self.basepath, self.relpath)) as f:
             data = f.read()
-            query, discrete_fields, continuous_fields = data.split("---")
+            query, discrete_fields, continuous_fields = data.split(SEP)
             discrete_fields = [x.strip() for x in discrete_fields.split(",") \
                                    if x.strip()]
             continuous_fields = [x.strip() for x in continuous_fields.split(",") \
@@ -95,7 +103,8 @@ class DumbParameterizedQueryTable(PandasCacheableTable):
             return
         min_itemsize = self.query_min_itemsize()
         if min_itemsize is not None and min_itemsize['finalized']:
-            logger.debug("will not set min_itemsize, already finalized")
+            pass
+            # log.debug("will not set min_itemsize, already finalized")
         else:
             if 'finalized' not in val:
                 val['finalized'] = False
@@ -181,7 +190,9 @@ class DumbParameterizedQueryTable(PandasCacheableTable):
     
     def cache_data(self, query_params):
         q = self.cache_query(query_params)
-        print str(q)
+        log.debug(str(q))
+
+
         cur = self.session.execute(q)
         
         min_itemsize = self.min_itemsize if self.min_itemsize else {}
@@ -335,19 +346,23 @@ class BulkParameterizedQueryTable(DumbParameterizedQueryTable):
             return None
         else:
             return result['_start_row'], result['_end_row']
-        
+
 class FlexibleSqlCaching(BulkParameterizedQueryTable):
+    def __init__(self,other_params):
+        self.__dict__.update(other_params.__dict__)
+
     def init_from_file(self):
         with open(join(self.basepath, self.relpath)) as f:
-            data = f.read()
-            query, fields = data.split("+++")
+            data = yaml.load(f)
+            assert len(data['SQL'].keys()) == 1
+            key = data['SQL'].keys()[0]
+            query = data['SQL'][key]['query']
+            fields = data['SQL'][key]['conditionals']
+
             self.query = query
-            fields = [x.strip() for x in fields.split(",") \
-                          if x.strip()]
             self.fields = fields
-            for f in fields:
-                setattr(self, f, column(f))
-                
+
+
     def select(self, query_filter, where=None):
         cache_info = self.cache_info(query_filter)
         if cache_info is None:
@@ -363,95 +378,21 @@ class FlexibleSqlCaching(BulkParameterizedQueryTable):
     def cache_query(self, query_filter):
         q = """ * from (%s) as X """
         q = q % self.query
-        query = self.session.query(q).filter(query_filter)
-        return query
-    def gethashval(self, query_filter):
-        hashval = gethashval((str(query_filter), 
-                              query_filter.compile().construct_params()))
-        return hashval
-    def store_cache_spec(self, query_filter, start_row, end_row):
-        hashval = self.gethashval(query_filter)
-        data = pd.DataFrame({'hashval' : [hashval], 
-                             '_start_row' : start_row,
-                             '_end_row' : end_row})
-        write_pandas(self.store, 'cache_spec', data, {}, 1.1,
-                     replace=False)
-        
-    def cache_info(self, query_filter):
-        hashval = self.gethashval(query_filter)
-        try:
-            result = self.store.select('cache_spec', where=[('hashval', hashval)])
-        except KeyError:
-            return None
-        if result is None:
-            return None
-        if result.shape[0] == 0:
-            return None
+        if not hasattr(query_filter,'compile'):
+            query = self.session.query(q)
         else:
-            return result['_start_row'], result['_end_row']
-    def repr_data(self):
-        repr_data = super(DumbParameterizedQueryTable, self).repr_data()
-        repr_data.append("query: %s" % self.query)
-        repr_data.append("fields: %s" % self.fields)
-        return repr_data
-
-
-class MetaSqlCaching(BulkParameterizedQueryTable):
-    def __init__(self, *args, **kwargs):
-        super(BulkParameterizedQueryTable, self).__init__(*args, **kwargs)
-        if self.query is None:
-            self.init_from_file()
-        self.engine = create_engine(*self.sqlalchemy_args,
-                                    **self.sqlalchemy_kwargs)
-        self.session = sessionmaker(bind=self.engine)()
-        self._build_enums()
-
-    def init_from_file(self):
-        with open(join(self.basepath, self.relpath)) as f:
-            data = f.read()
-            query, meta = data.split("+++")
-            self.query = query
-            self.meta = json.loads(meta)
-
-    def _build_enums(self):
-        if self.meta.has_key('enum_params'):
-            for k in self.meta['enum_params'].keys():
-                v = self.meta['enum_params'][k]
-                if isinstance(v, unicode):
-                    pass
-                    df = self._execute_query_df(v)
-                    setattr(self,k,df)
-                if isinstance(v, list):
-                    setattr(self,k,v)
-
-    def _execute_query_df(self, query=None):
-        #this should really be cached like everything else
-        if query is None:
-            query = self.query
-        results = self.session.execute(query).fetchall()
-        return pd.DataFrame.from_records(results)
-
-    def select(self, query_filter, where=None):
-        cache_info = self.cache_info(query_filter)
-        if cache_info is None:
-            self.cache_data(query_filter)
-            cache_info = self.cache_info(query_filter)
-        start_row, end_row = cache_info
-        if not where:
-            where = None
-        result = self.store.select(self.localpath, where=where,
-                                   start=start_row, stop=end_row)
-        return result
-
-    def cache_query(self, query_filter):
-        q = """ * from (%s) as X """
-        q = q % self.query
-        query = self.session.query(q).filter(query_filter)
+            query = self.session.query(q).filter(query_filter)
         return query
+
     def gethashval(self, query_filter):
-        hashval = gethashval((str(query_filter),
+
+        if not hasattr(query_filter,'compile'):
+            hashval = gethashval(('',''))
+        else:
+            hashval = gethashval((str(query_filter),
                               query_filter.compile().construct_params()))
         return hashval
+
     def store_cache_spec(self, query_filter, start_row, end_row):
         hashval = self.gethashval(query_filter)
         data = pd.DataFrame({'hashval' : [hashval],
@@ -475,5 +416,278 @@ class MetaSqlCaching(BulkParameterizedQueryTable):
     def repr_data(self):
         repr_data = super(DumbParameterizedQueryTable, self).repr_data()
         repr_data.append("query: %s" % self.query)
-        repr_data.append("meta: %s" % self.meta)
+        repr_data.append("fields: %s" % self.fields)
         return repr_data
+
+
+class YamlSqlDateCaching(BulkParameterizedQueryTable):
+    def init_from_file(self):
+        with open(join(self.basepath, self.relpath)) as f:
+            data = yaml.load(f)
+            assert len(data['SQL'].keys()) == 1
+
+            key = data['SQL'].keys()[0]
+            query = data['SQL'][key]['query']
+            if 'conditionals' in data['SQL'][key].keys():
+                fields = data['SQL'][key]['conditionals']
+            else:
+                fields = None
+
+            self.query = query
+            self.fields = fields
+
+            #no conditionals defined
+            if fields is not None:
+                for f in fields:
+                    name = f.lower()
+                    setattr(self, name, column(name))
+
+    def select(self, query_filter, where=None, **kwargs):
+
+        ignore_cache = kwargs.get('IgnoreCache',None)
+        if ignore_cache:
+            query = self.compiled_query(query_filter,kwargs)
+            return query
+
+
+        if 'date' not in kwargs.keys():
+            #no dates in query
+
+            fs = FlexibleSqlCaching(self)
+            fs.localpath = self.localpath
+            fs.urlpath = self.urlpath
+            fs.store = self.store
+            result = fs.select(query_filter)
+            return result
+
+        else:
+            dateKeys = [k for k in kwargs.keys() if 'date' in k]
+            dateKeys = sorted(dateKeys)
+            start_date, end_date = kwargs[dateKeys[0]], kwargs[dateKeys[1]]
+
+
+            result = self.cache_info(query_filter,start_date, end_date)
+
+            if result is None:
+                self.cache_data(query_filter, start_date, end_date)
+                result = self.cache_info(query_filter,start_date, end_date)
+
+        return result
+
+    def cache_query(self, query_filter):
+        q = """ * from (%s) as X """
+        q = q % self.query
+        query = self.session.query(q).filter(query_filter)
+        return query
+
+    def gethashval(self, query_filter):
+        hashval = gethashval((str(query_filter),
+                              query_filter.compile().construct_params()))
+        return hashval
+    def store_cache_spec(self, query_filter, start_row, end_row, start_date, end_date):
+        hashval = self.gethashval(query_filter)
+        data = pd.DataFrame({'hashval' : [hashval],
+                             '_start_row' : start_row,
+                             '_end_row' : end_row,
+                             'start_date': start_date,
+                             'end_date': end_date,})
+        write_pandas(self.store, 'cache_spec', data, {}, 1.1,
+                     replace=False)
+
+    def cache_info(self, query_filter, start_date, end_date):
+        hashval = self.gethashval(query_filter)
+        try:
+
+            # print self.store['/cache_spec']
+
+            result = self.store.select('cache_spec', where=[('hashval', hashval),
+                                                            ('start_date',start_date)])
+            start_date = pd.Timestamp(start_date)
+            end_date = pd.Timestamp(end_date)
+
+            max_date = self.store['/cache_spec']['end_date'].max()
+            min_date = self.store['/cache_spec']['start_date'].min()
+
+            #inner selection
+            if (start_date >= min_date) and (end_date <= max_date):
+
+                result = self.munge_tables(hashval, start_date,end_date)
+                return result
+
+            #left shift
+            elif (start_date < min_date) and (end_date <= max_date):
+                return self.shift_left(query_filter, hashval, start_date,end_date)
+
+            #right shift
+            elif (start_date >= min_date) and (end_date > max_date):
+                return self.shift_right(query_filter, hashval, start_date,end_date)
+
+            #full_outer
+            elif (start_date < min_date) and (end_date > max_date):
+                right = self.shift_right(query_filter, hashval, start_date,end_date)
+                left = self.shift_left(query_filter, hashval, start_date,end_date)
+                data = right.append(left)
+                data.reset_index(inplace=True)
+                data = data.drop(['index'],axis=1)
+                return data
+
+            else:
+                print 'something terrible has gone wrong'
+                print query_filter, hashval, start_date,end_date, max_date, min_date
+
+
+        except KeyError:
+            return None
+        if result is None:
+            return None
+        if result.shape[0] == 0:
+            return None
+        else:
+            return result['_start_row'], result['_end_row']
+
+    def repr_data(self):
+        repr_data = super(DumbParameterizedQueryTable, self).repr_data()
+        repr_data.append("query: %s" % self.query)
+        repr_data.append("fields: %s" % self.fields)
+        return repr_data
+
+    def cache_data(self, query_params, start_date, end_date):
+
+        for f in self.fields:
+            if 'date' in f:
+                col_date = f
+                break;
+
+        all_query = and_(query_params,column(col_date) >=start_date, column(col_date) <= end_date)
+
+        q = self.cache_query(all_query)
+        log.debug(str(q))
+
+        cur = self.session.execute(q)
+
+        min_itemsize = self.min_itemsize if self.min_itemsize else {}
+        db_string_types = self.db_string_types if self.db_string_types else []
+        db_datetime_types = self.db_datetime_types if self.db_datetime_types else []
+
+        #hack
+        cur.description = cur._cursor_description()
+        cur.arraysize = 500
+
+        columns, min_itemsize, dt_fields = query_info(
+            cur,
+            min_itemsize=min_itemsize,
+            db_string_types=db_string_types,
+            db_datetime_types=db_datetime_types
+            )
+
+        self.min_itemsize = min_itemsize
+        self.finalize_min_itemsize()
+        overrides = self.col_types
+        for k in dt_fields:
+            overrides[k] = 'datetime64[ns]'
+        try:
+            starting_row = self.table.nrows
+        except AttributeError:
+            starting_row = 0
+        write_pandas_hdf_from_cursor(self.store, self.localpath, cur,
+                                     columns, self.min_itemsize,
+                                     dtype_overrides=overrides,
+                                     min_item_padding=self.min_item_padding,
+                                     chunksize=50000,
+                                     replace=False)
+        try:
+            ending_row = self.table.nrows
+        except AttributeError:
+            ending_row = 0
+
+        self.store_cache_spec(query_params, starting_row, ending_row, start_date, end_date)
+
+
+    def munge_tables(self, hashval, start_date, end_date):
+
+        store = self.store
+        store.select('cache_spec', where=[('hashval', hashval)])
+
+        store['/cache_spec'][['start_date','end_date']].sort(['start_date'])
+
+        df_min = store.select('cache_spec', where=[('start_date', '<=', start_date)]).reset_index()
+        df_max = store.select('cache_spec', where=[('end_date', '<=', end_date)]).reset_index()
+
+        df_total = df_min.append(df_max)
+        df_total.drop_duplicates('_end_row',inplace=True)
+        df_total.reset_index(inplace=True)
+
+        ss_vals = df_total[['_start_row','_end_row', ]].values
+
+        df_list = []
+        for s in ss_vals:
+            start_row = s[0]
+            end_row = s[1]
+
+            temp = store.select(self.localpath,
+                                           start=start_row, stop=end_row)
+            temp.head()
+
+            df_list.append(temp)
+
+        df_concat = pd.concat(df_list)
+        df_concat.sort(['date'],inplace=True)
+
+        df_return = df_concat[(df_concat['date'] >= start_date) & (df_concat['date'] <= end_date)]
+
+        return df_return
+
+
+    def shift_right(self,query_filter, hashval, start_date,end_date):
+        '''
+        the query contains date closer in time than the max.
+        fetch data from current max to end_data
+        '''
+        max_date = self.store['/cache_spec']['end_date'].max()
+
+        max_date = max_date.to_datetime()
+
+        start_date = start_date.to_datetime()
+        end_date = end_date.to_datetime()
+
+        self.cache_data(query_filter, max_date, end_date)
+
+        return self.munge_tables(hashval, start_date, end_date)
+
+    def shift_left(self,query_filter, hashval, start_date,end_date):
+        '''
+        the query contains date further in time than the minimum.
+        fetch data from current max to end_data
+        '''
+        min_date = self.store['/cache_spec']['start_date'].min()
+
+        min_date = min_date.to_datetime()
+
+        start_date = start_date.to_datetime()
+        end_date = end_date.to_datetime()
+
+        self.cache_data(query_filter, start_date, min_date)
+
+        return self.munge_tables(hashval, start_date, end_date)
+
+    def compiled_query(self,query_params,kwargs):
+        if 'date' not in kwargs.keys():
+            all_query = and_(query_params)
+            result = self.cache_query(all_query)
+            return str(result)
+
+        else:
+            dateKeys = [k for k in kwargs.keys() if 'date' in k]
+            dateKeys = sorted(dateKeys)
+            start_date, end_date = kwargs[dateKeys[0]], kwargs[dateKeys[1]]
+
+            for f in self.fields:
+                if 'date' in f:
+                    col_date = f
+                    break;
+
+            all_query = and_(query_params,column(col_date) >=start_date, column(col_date) <= end_date)
+
+            result = self.cache_query(all_query)
+
+            return str(result)
